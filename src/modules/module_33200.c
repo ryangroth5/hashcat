@@ -70,6 +70,21 @@ static const u32 SCRYPT_THREADS = 32;
 
 #include "scrypt_common.c"
 
+char *module_jit_build_options (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const user_options_t *user_options, MAYBE_UNUSED const user_options_extra_t *user_options_extra, MAYBE_UNUSED const hashes_t *hashes, MAYBE_UNUSED const hc_device_param_t *device_param)
+{
+  char *base_options = scrypt_module_jit_build_options (hashconfig, user_options, user_options_extra, hashes, device_param);
+
+  if (device_param->opencl_device_vendor_id == VENDOR_ID_NV)
+  {
+    char *full_options = NULL;
+    hc_asprintf (&full_options, "%s", base_options);
+    hcfree (base_options);
+    return full_options;
+  }
+
+  return base_options;
+}
+
 int module_hash_decode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED void *digest_buf, MAYBE_UNUSED salt_t *salt, MAYBE_UNUSED void *esalt_buf, MAYBE_UNUSED void *hook_salt_buf, MAYBE_UNUSED hashinfo_t *hash_info, const char *line_buf, MAYBE_UNUSED const int line_len)
 {
   u32 *digest = (u32 *) digest_buf;
@@ -154,18 +169,21 @@ int module_hash_decode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
   if (enc_len != 64) return (PARSER_HASH_LENGTH);
 
   // Layout in salt_buf beyond the scrypt salt:
-  //   salt_buf[8..11]  = nonce   (bytes  0-15 of EncryptedKey)
-  //   salt_buf[12..19] = ct      (bytes 16-47 of EncryptedKey)
+  //   salt_buf[8..15]  = zeros   (must be zero: sha256_update_global_swap reads
+  //                                64 bytes from salt_buf even when salt_len=32,
+  //                                and non-zero bytes here contaminate the SHA256 state)
+  //   salt_buf[16..19] = nonce   (bytes  0-15 of EncryptedKey)
+  //   salt_buf[20..27] = ct      (bytes 16-47 of EncryptedKey)
   // The GCM tag (bytes 48-63) goes into digest_buf[0..3]
   //
   // AES-GCM functions in OpenCL expect big-endian u32.
   // memcpy from u8 to u32 on x86 produces little-endian, so we byte-swap.
 
-  memcpy (salt->salt_buf + 8,  tmp_buf,      16); // nonce
-  memcpy (salt->salt_buf + 12, tmp_buf + 16, 32); // ciphertext
+  memcpy (salt->salt_buf + 16, tmp_buf,      16); // nonce
+  memcpy (salt->salt_buf + 20, tmp_buf + 16, 32); // ciphertext
 
   // Byte-swap nonce and ct to big-endian u32 for AES-GCM
-  for (int i = 8; i < 20; i++)
+  for (int i = 16; i < 28; i++)
     salt->salt_buf[i] = byte_swap_32 (salt->salt_buf[i]);
 
   // GCM tag -> digest (stored as big-endian u32 to match AES-GCM output)
@@ -181,7 +199,7 @@ int module_hash_encode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
   // Reconstruct the 64-byte EncryptedKey from salt_buf + digest_buf
   // salt_buf and digest are stored as big-endian u32 — swap back to raw bytes.
   u32 tmp32[20];
-  for (int i = 0; i < 12; i++) tmp32[i] = byte_swap_32 (salt->salt_buf[8 + i]);
+  for (int i = 0; i < 12; i++) tmp32[i] = byte_swap_32 (salt->salt_buf[16 + i]);
 
   const u32 *dg = (const u32 *) digest_buf;
   u32 tag32[4];
@@ -269,7 +287,7 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_hook23                   = MODULE_DEFAULT;
   module_ctx->module_hook_salt_size           = MODULE_DEFAULT;
   module_ctx->module_hook_size                = MODULE_DEFAULT;
-  module_ctx->module_jit_build_options        = scrypt_module_jit_build_options;
+  module_ctx->module_jit_build_options        = module_jit_build_options;
   module_ctx->module_jit_cache_disable        = MODULE_DEFAULT;
   module_ctx->module_kernel_accel_max         = MODULE_DEFAULT;
   module_ctx->module_kernel_accel_min         = MODULE_DEFAULT;

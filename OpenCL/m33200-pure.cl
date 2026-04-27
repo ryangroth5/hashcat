@@ -1,8 +1,6 @@
 /**
  * Author......: See docs/credits.txt
  * License.....: MIT
- *
- * Mode 33200 - gocryptfs
  */
 
 #ifdef KERNEL_STATIC
@@ -69,12 +67,6 @@ KERNEL_FQ KERNEL_FA void m33200_comp (KERN_ATTR_TMPS (scrypt_tmp_t))
   const u64 lid = get_local_id (0);
   const u64 lsz = get_local_size (0);
 
-  /**
-   * AES shared memory (must be set up before GID check)
-   */
-
-  #ifdef REAL_SHM
-
   LOCAL_VK u32 s_te0[256];
   LOCAL_VK u32 s_te1[256];
   LOCAL_VK u32 s_te2[256];
@@ -92,71 +84,89 @@ KERNEL_FQ KERNEL_FA void m33200_comp (KERN_ATTR_TMPS (scrypt_tmp_t))
 
   SYNC_THREADS ();
 
-  #else
-
-  CONSTANT_AS u32a *s_te0 = te0;
-  CONSTANT_AS u32a *s_te1 = te1;
-  CONSTANT_AS u32a *s_te2 = te2;
-  CONSTANT_AS u32a *s_te3 = te3;
-  CONSTANT_AS u32a *s_te4 = te4;
-
-  #endif
-
   if (gid >= GID_CNT) return;
 
   scrypt_blockmix_out (tmps[gid].out, tmps[gid].in, SCRYPT_SZ);
 
-  /* Declare AES arrays early so compiler allocates them separately from HKDF vars */
-  u32 key[60] = { 0 };
-  u32 subkey[4] = { 0 };
+  // Step 3 of scrypt RFC 7914: PBKDF2-HMAC-SHA256(password, B', 1, 32) -> scrypt_key
+  u32 scrypt_key[8];
+  scrypt_pbkdf2_ggp (pws[gid].i, pws[gid].pw_len, tmps[gid].in, SCRYPT_SZ, scrypt_key, 32);
 
-  sha256_hmac_ctx_t ctx;
+  // HKDF-Extract: HMAC-SHA256(key=0x00*32, data=scrypt_key) -> PRK
+  u32 enc_key[8];
 
-  sha256_hmac_init_global_swap (&ctx, pws[gid].i, pws[gid].pw_len);
-  sha256_hmac_update_global_swap (&ctx, tmps[gid].in, SCRYPT_SZ);
+  {
+    sha256_hmac_ctx_t ctx;
 
-  u32 z4[4] = { 0, 0, 0, 0 };
-  u32 cb[4] = { 1, 0, 0, 0 };
-  sha256_hmac_update_64 (&ctx, cb, z4, z4, z4, 4);
-  sha256_hmac_final (&ctx);
-  /* ctx.opad.h[0..7] = scrypt key (BE u32) */
+    u32 zk0[4] = {0, 0, 0, 0};
+    u32 zk1[4] = {0, 0, 0, 0};
+    u32 z4[4]  = {0, 0, 0, 0};
 
-  u32 sk0 = ctx.opad.h[0]; u32 sk1 = ctx.opad.h[1];
-  u32 sk2 = ctx.opad.h[2]; u32 sk3 = ctx.opad.h[3];
-  u32 sk4 = ctx.opad.h[4]; u32 sk5 = ctx.opad.h[5];
-  u32 sk6 = ctx.opad.h[6]; u32 sk7 = ctx.opad.h[7];
+    // scrypt_key is stored as LE u32 (from pbkdf2_body_pp hc_swap32_S).
+    // sha256_hmac_update_64 expects BE u32 (SHA256 internal format).
+    u32 sk_be[8];
+    sk_be[0] = hc_swap32_S (scrypt_key[0]); sk_be[1] = hc_swap32_S (scrypt_key[1]);
+    sk_be[2] = hc_swap32_S (scrypt_key[2]); sk_be[3] = hc_swap32_S (scrypt_key[3]);
+    sk_be[4] = hc_swap32_S (scrypt_key[4]); sk_be[5] = hc_swap32_S (scrypt_key[5]);
+    sk_be[6] = hc_swap32_S (scrypt_key[6]); sk_be[7] = hc_swap32_S (scrypt_key[7]);
 
-  sha256_hmac_init_64 (&ctx, z4, z4, z4, z4);
-  u32 sk_lo[4] = { sk0, sk1, sk2, sk3 };
-  u32 sk_hi[4] = { sk4, sk5, sk6, sk7 };
-  sha256_hmac_update_64 (&ctx, sk_lo, sk_hi, z4, z4, 32);
-  sha256_hmac_final (&ctx);
-  /* ctx.opad.h[0..7] = PRK (BE u32) */
+    sha256_hmac_init_64 (&ctx, zk0, zk1, z4, z4);
+    sha256_hmac_update_64 (&ctx, sk_be, sk_be + 4, z4, z4, 32);
+    sha256_hmac_final (&ctx);
 
-  u32 prk0 = ctx.opad.h[0]; u32 prk1 = ctx.opad.h[1];
-  u32 prk2 = ctx.opad.h[2]; u32 prk3 = ctx.opad.h[3];
-  u32 prk4 = ctx.opad.h[4]; u32 prk5 = ctx.opad.h[5];
-  u32 prk6 = ctx.opad.h[6]; u32 prk7 = ctx.opad.h[7];
+    u32 prk[8];
+    prk[0] = ctx.opad.h[0]; prk[1] = ctx.opad.h[1];
+    prk[2] = ctx.opad.h[2]; prk[3] = ctx.opad.h[3];
+    prk[4] = ctx.opad.h[4]; prk[5] = ctx.opad.h[5];
+    prk[6] = ctx.opad.h[6]; prk[7] = ctx.opad.h[7];
 
-  u32 prk_lo[4] = { prk0, prk1, prk2, prk3 };
-  u32 prk_hi[4] = { prk4, prk5, prk6, prk7 };
-  sha256_hmac_init_64 (&ctx, prk_lo, prk_hi, z4, z4);
+    // HKDF-Expand: HMAC-SHA256(key=PRK, data="AES-GCM file content encryption\x01") -> enc_key
+    u32 info0[4] = {0x4145532d, 0x47434d20, 0x66696c65, 0x20636f6e};
+    u32 info1[4] = {0x74656e74, 0x20656e63, 0x72797074, 0x696f6e01};
+    sha256_hmac_init_64 (&ctx, prk, prk + 4, z4, z4);
+    sha256_hmac_update_64 (&ctx, info0, info1, z4, z4, 32);
+    sha256_hmac_final (&ctx);
 
-  u32 info_lo[4] = { 0x4145532d, 0x47434d20, 0x66696c65, 0x20636f6e };
-  u32 info_hi[4] = { 0x74656e74, 0x20656e63, 0x72797074, 0x696f6e01 };
-  sha256_hmac_update_64 (&ctx, info_lo, info_hi, z4, z4, 32);
-  sha256_hmac_final (&ctx);
-  /* ctx.opad.h[0..7] = enc_key (BE u32) */
+    enc_key[0] = ctx.opad.h[0]; enc_key[1] = ctx.opad.h[1];
+    enc_key[2] = ctx.opad.h[2]; enc_key[3] = ctx.opad.h[3];
+    enc_key[4] = ctx.opad.h[4]; enc_key[5] = ctx.opad.h[5];
+    enc_key[6] = ctx.opad.h[6]; enc_key[7] = ctx.opad.h[7];
+  }
 
-  /* DEBUG: output enc_key[0..3] before AES, with key[60] declared early */
-  const u32 r0 = ctx.opad.h[0];
-  const u32 r1 = ctx.opad.h[1];
-  const u32 r2 = ctx.opad.h[2];
-  const u32 r3 = ctx.opad.h[3];
+  // AES-256-GCM verification
+  {
+    u32 key[60] = {0};
+    u32 subkey[4] = {0};
+    AES_GCM_Init (enc_key, 256, key, subkey, s_te0, s_te1, s_te2, s_te3, s_te4);
 
-  #define il_pos 0
+    // nonce stored at salt_buf[16..19] (bytes 0-15 of EncryptedKey, big-endian u32)
+    u32 nonce[4];
+    nonce[0] = salt_bufs[SALT_POS_HOST].salt_buf[16];
+    nonce[1] = salt_bufs[SALT_POS_HOST].salt_buf[17];
+    nonce[2] = salt_bufs[SALT_POS_HOST].salt_buf[18];
+    nonce[3] = salt_bufs[SALT_POS_HOST].salt_buf[19];
 
-  #ifdef KERNEL_STATIC
-  #include COMPARE_M
-  #endif
+    u32 J0[4] = {0};
+    AES_GCM_Prepare_J0 (nonce, 16, subkey, J0);
+
+    // additional data: 8 zero bytes (blockNo=0, fileID=nil)
+    u32 ad[2] = {0, 0};
+    u32 S[4] = {0};
+    // ciphertext at salt_buf[20..27] (bytes 16-47 of EncryptedKey, 32 bytes)
+    AES_GCM_GHASH_GLOBAL (subkey, ad, 8, salt_bufs[SALT_POS_HOST].salt_buf + 20, 32, S);
+
+    u32 tag[4] = {0};
+    AES_GCM_GCTR (key, J0, S, 16, tag, s_te0, s_te1, s_te2, s_te3, s_te4);
+
+    const u32 r0 = tag[0];
+    const u32 r1 = tag[1];
+    const u32 r2 = tag[2];
+    const u32 r3 = tag[3];
+
+    #define il_pos 0
+
+    #ifdef KERNEL_STATIC
+    #include COMPARE_M
+    #endif
+  }
 }
